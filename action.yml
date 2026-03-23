@@ -1,0 +1,147 @@
+name: 'Latchkey Fast Cache'
+author: 'Latchkey'
+description: >
+  High-performance streaming cache for Latchkey managed runners.
+  Uses a single streaming HTTP request instead of the serial chunk pattern
+  used by actions/cache@v4, eliminating Node.js bootstrap, reserve/commit
+  API overhead, and serial 32MB PATCH round trips.
+
+branding:
+  icon: 'zap'
+  color: 'orange'
+
+inputs:
+  action:
+    description: '"save" or "restore"'
+    required: true
+  path:
+    description: 'Path(s) to cache (newline or space separated)'
+    required: true
+  key:
+    description: 'Cache key (e.g., gradle-${{ hashFiles("**/*.gradle*") }})'
+    required: true
+  cache-url:
+    description: 'Cache proxy base URL'
+    required: false
+    default: 'http://localhost:8080'
+
+outputs:
+  cache-hit:
+    description: 'Whether the cache was restored successfully'
+    value: ${{ steps.restore.outputs.cache-hit }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ── Restore ──────────────────────────────────────────────────
+    - name: Restore cache
+      id: restore
+      if: inputs.action == 'restore'
+      shell: bash
+      env:
+        CACHE_KEY: ${{ inputs.key }}
+        CACHE_PATHS: ${{ inputs.path }}
+        CACHE_URL: ${{ inputs.cache-url }}
+      run: |
+        set -euo pipefail
+
+        # Version is derived from RUNNER_OS for cache isolation across OS types
+        VERSION="${RUNNER_OS}"
+
+        ENCODED_KEY=$(printf '%s' "$CACHE_KEY" | jq -sRr @uri)
+        ENCODED_VERSION=$(printf '%s' "$VERSION" | jq -sRr @uri)
+        URL="${CACHE_URL}/v2/cache?key=${ENCODED_KEY}&version=${ENCODED_VERSION}"
+
+        echo "Restoring cache: key=${CACHE_KEY} version=${VERSION}"
+
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --head "${URL}")
+
+        if [ "$HTTP_CODE" = "404" ]; then
+          echo "Cache miss"
+          echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "::warning::Cache lookup failed with HTTP ${HTTP_CODE}"
+          echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Stream: download → decompress → extract (no intermediate files)
+        START_MS=$(date +%s%3N)
+
+        if curl -sf "${URL}" | zstd -d | tar xf - -C /; then
+          END_MS=$(date +%s%3N)
+          DURATION_MS=$((END_MS - START_MS))
+          echo "Cache restored in ${DURATION_MS}ms"
+          echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::Cache restore failed, continuing without cache"
+          echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # ── Save ─────────────────────────────────────────────────────
+    - name: Save cache
+      id: save
+      if: inputs.action == 'save'
+      shell: bash
+      env:
+        CACHE_KEY: ${{ inputs.key }}
+        CACHE_PATHS: ${{ inputs.path }}
+        CACHE_URL: ${{ inputs.cache-url }}
+      run: |
+        set -euo pipefail
+
+        VERSION="${RUNNER_OS}"
+
+        ENCODED_KEY=$(printf '%s' "$CACHE_KEY" | jq -sRr @uri)
+        ENCODED_VERSION=$(printf '%s' "$VERSION" | jq -sRr @uri)
+        URL="${CACHE_URL}/v2/cache?key=${ENCODED_KEY}&version=${ENCODED_VERSION}"
+
+        # Check if cache already exists (skip compression + upload)
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --head "${URL}")
+        if [ "$HTTP_CODE" = "200" ]; then
+          echo "Cache already exists for key=${CACHE_KEY}, skipping save"
+          exit 0
+        fi
+
+        # Resolve paths: expand ~ and make absolute
+        RESOLVED_PATHS=()
+        while IFS= read -r path || [ -n "$path" ]; do
+          path=$(echo "$path" | xargs)  # trim whitespace
+          [ -z "$path" ] && continue
+
+          # Expand ~
+          eval path="$path"
+
+          # Make absolute
+          if [[ "$path" != /* ]]; then
+            path="${GITHUB_WORKSPACE}/${path}"
+          fi
+
+          if [ -e "$path" ]; then
+            RESOLVED_PATHS+=("$path")
+          else
+            echo "::warning::Cache path does not exist, skipping: ${path}"
+          fi
+        done <<< "$CACHE_PATHS"
+
+        if [ ${#RESOLVED_PATHS[@]} -eq 0 ]; then
+          echo "::warning::No valid cache paths found, skipping save"
+          exit 0
+        fi
+
+        echo "Saving cache: key=${CACHE_KEY} version=${VERSION}"
+        echo "  Paths: ${RESOLVED_PATHS[*]}"
+
+        # Stream: tar → compress → upload (single PUT, no intermediate files)
+        START_MS=$(date +%s%3N)
+
+        tar cf - "${RESOLVED_PATHS[@]}" \
+          | zstd -T0 --fast \
+          | curl -sf -X PUT -T - "${URL}"
+
+        END_MS=$(date +%s%3N)
+        DURATION_MS=$((END_MS - START_MS))
+        echo "Cache saved in ${DURATION_MS}ms"
