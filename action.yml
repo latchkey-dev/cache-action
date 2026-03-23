@@ -18,7 +18,7 @@ inputs:
     description: 'Path(s) to cache (newline or space separated)'
     required: true
   key:
-    description: 'Cache key (e.g., gradle-${{ hashFiles("**/*.gradle*") }})'
+    description: 'Cache key'
     required: true
   cache-url:
     description: 'Cache proxy base URL'
