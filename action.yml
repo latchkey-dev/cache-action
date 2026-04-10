@@ -71,7 +71,7 @@ runs:
         # Stream: download → decompress → extract (no intermediate files)
         START_MS=$(date +%s%3N)
 
-        if curl -sf "${URL}" | zstd -d | tar xf - -C /; then
+        if curl -sf "${URL}" | zstd -d -T0 | tar xf - -C /; then
           END_MS=$(date +%s%3N)
           DURATION_MS=$((END_MS - START_MS))
           echo "Cache restored in ${DURATION_MS}ms"
@@ -112,8 +112,12 @@ runs:
           path=$(echo "$path" | xargs)  # trim whitespace
           [ -z "$path" ] && continue
 
-          # Expand ~
-          eval path="$path"
+          # Expand ~ safely (no eval — avoids command injection)
+          if [[ "$path" == "~/"* ]]; then
+            path="${HOME}${path:1}"
+          elif [[ "$path" == "~" ]]; then
+            path="$HOME"
+          fi
 
           # Make absolute
           if [[ "$path" != /* ]]; then
