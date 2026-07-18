@@ -54,7 +54,11 @@ runs:
 
         echo "Restoring cache: key=${CACHE_KEY} version=${VERSION}"
 
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --head "${URL}")
+        # `|| true` keeps set -e from killing the step when the proxy is
+        # unreachable (a runner without the Latchkey sidecar, e.g. a
+        # GitHub-hosted runner): curl exits non-zero but still prints 000,
+        # which the != 200 branch below turns into a warn-and-continue miss.
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 15 --head "${URL}" || true)
 
         if [ "$HTTP_CODE" = "404" ]; then
           echo "Cache miss"
@@ -71,7 +75,7 @@ runs:
         # Stream: download → decompress → extract (no intermediate files)
         START_MS=$(date +%s%3N)
 
-        if curl -sf "${URL}" | zstd -d -T0 | tar xf - -C /; then
+        if curl -sf --connect-timeout 5 "${URL}" | zstd -d -T0 | tar xf - -C /; then
           END_MS=$(date +%s%3N)
           DURATION_MS=$((END_MS - START_MS))
           echo "Cache restored in ${DURATION_MS}ms"
@@ -99,8 +103,9 @@ runs:
         ENCODED_VERSION=$(printf '%s' "$VERSION" | jq -sRr @uri)
         URL="${CACHE_URL}/v2/cache?key=${ENCODED_KEY}&version=${ENCODED_VERSION}"
 
-        # Check if cache already exists (skip compression + upload)
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --head "${URL}")
+        # Check if cache already exists (skip compression + upload). `|| true`
+        # for the same unreachable-proxy reason as the restore probe.
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 15 --head "${URL}" || true)
         if [ "$HTTP_CODE" = "200" ]; then
           echo "Cache already exists for key=${CACHE_KEY}, skipping save"
           exit 0
@@ -139,12 +144,17 @@ runs:
         echo "Saving cache: key=${CACHE_KEY} version=${VERSION}"
         echo "  Paths: ${RESOLVED_PATHS[*]}"
 
-        # Stream: tar → compress → upload (single PUT, no intermediate files)
+        # Stream: tar → compress → upload (single PUT, no intermediate files).
+        # A failed save must never fail the customer's job: the build already
+        # succeeded, the cache is an optimization.
         START_MS=$(date +%s%3N)
 
-        tar cf - "${RESOLVED_PATHS[@]}" \
+        if ! tar cf - "${RESOLVED_PATHS[@]}" \
           | zstd -T0 --fast \
-          | curl -sf -X PUT -T - "${URL}"
+          | curl -sf --connect-timeout 5 -X PUT -T - "${URL}"; then
+          echo "::warning::Cache save failed, continuing without saving"
+          exit 0
+        fi
 
         END_MS=$(date +%s%3N)
         DURATION_MS=$((END_MS - START_MS))
